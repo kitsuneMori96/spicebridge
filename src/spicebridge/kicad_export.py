@@ -308,9 +308,10 @@ def _route_wires(
         for i in range(len(pin_list) - 1):
             x1, y1 = pin_list[i]
             x2, y2 = pin_list[i + 1]
-            # Manhattan L-route: horizontal then vertical
+            # Manhattan L-route: horizontal then vertical. Pin positions sit on
+            # the 1.27 mm half-grid, so the elbow must reuse them verbatim.
             if x1 != x2 and y1 != y2:
-                mid = (_snap_to_grid(x2), _snap_to_grid(y1))
+                mid = (x2, y1)
                 wires.append(Wire((x1, y1), mid))
                 wires.append(Wire(mid, (x2, y2)))
                 if i > 0:

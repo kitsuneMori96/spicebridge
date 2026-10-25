@@ -9,6 +9,7 @@ import pytest
 from spicebridge.kicad_export import (
     _find_ground_pins,
     _layout_components,
+    _node_pin_numbers,
     _resolve_symbol_info,
     _route_wires,
     _snap_to_grid,
@@ -121,7 +122,15 @@ class TestSymbolMapping:
 
     def test_subcircuit_mapping(self):
         info = _resolve_symbol_info("X", "OPAMP")
-        assert info.lib_id == "Simulation_SPICE:SUBCKT"
+        assert info.lib_id == "SPICE:SUBCKT_3"
+        assert info.pin_numbers == ["1", "2", "3"]
+
+    def test_pin_numbers_follow_spice_node_order(self):
+        # SPICE "Q c b e" / "D a k" / "M d g s" are not the KiCad pin order.
+        assert _node_pin_numbers("Q", 3) == ["C", "B", "E"]
+        assert _node_pin_numbers("D", 2) == ["A", "K"]
+        assert _node_pin_numbers("M", 3) == ["D", "G", "S"]
+        assert _node_pin_numbers("R", 2) == ["1", "2"]
 
     def test_all_basic_types_mapped(self):
         for comp_type in ("R", "C", "L", "D", "V", "I", "Q", "M", "X"):
