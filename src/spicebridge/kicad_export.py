@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -49,6 +50,78 @@ class Wire:
 # Symbol mapping
 # ---------------------------------------------------------------------------
 
+# SPICE node order -> KiCad pin number (the two orders are NOT the same:
+# a BJT netlist is "Qname C B E model" while Device:Q_NPN_BCE numbers B=1 C=2 E=3).
+_NODE_PIN_ORDER: dict[str, list[str]] = {
+    "D": ["A", "K"],          # Dname anode cathode
+    "Q": ["C", "B", "E"],     # Qname collector base emitter
+    "M": ["D", "G", "S"],     # Mname drain gate source
+}
+
+_LIB_PIN_CACHE: dict[str, dict[str, tuple[float, float]]] = {}
+
+
+def _lib_pins(lib_id: str) -> dict[str, tuple[float, float]]:
+    """Pin-number -> (x, y) map read straight from the embedded lib symbol."""
+    if lib_id in _LIB_PIN_CACHE:
+        return _LIB_PIN_CACHE[lib_id]
+    text = _LIB_SYMBOL_TEMPLATES.get(lib_id, "")
+    pins: dict[str, tuple[float, float]] = {}
+    for m in re.finditer(
+        r'\(pin \w+ \w+ \(at (-?[\d.]+) (-?[\d.]+) \d+\) \(length [\d.]+\)'
+        r' \(name "[^"]*"[^)]*\)+ \(number "([^"]+)"',
+        text,
+    ):
+        pins[m.group(3)] = (float(m.group(1)), float(m.group(2)))
+    _LIB_PIN_CACHE[lib_id] = pins
+    return pins
+
+
+def _node_pin_numbers(comp_type: str, n_nodes: int) -> list[str]:
+    """KiCad pin numbers in the same order as the SPICE nodes."""
+    if comp_type in _NODE_PIN_ORDER:
+        return _NODE_PIN_ORDER[comp_type][:n_nodes]
+    if comp_type == "X":
+        return [str(i + 1) for i in range(n_nodes)]
+    return [str(i + 1) for i in range(n_nodes)]
+
+
+def _ensure_subckt_symbol(n_pins: int) -> str:
+    """Build (once) a numbered box symbol for an n-pin X subcircuit."""
+    n_pins = max(3, n_pins)
+    lib_id = f"SPICE:SUBCKT_{n_pins}"
+    if lib_id in _LIB_SYMBOL_TEMPLATES:
+        return lib_id
+    base_name = lib_id.split(":")[-1]  # child unit names must drop the library prefix
+    top = (n_pins - 1) / 2 * 2.54
+    half_h = max(7.62, top + 2.54)
+    pin_lines = []
+    for i in range(n_pins):
+        y = top - i * 2.54
+        pin_lines.append(
+            f'        (pin passive line (at -7.62 {y:g} 0) (length 2.54)'
+            f' (name "{i + 1}" (effects (font (size 1.27 1.27))))'
+            f' (number "{i + 1}" (effects (font (size 1.27 1.27)))))'
+        )
+    _LIB_SYMBOL_TEMPLATES[lib_id] = (
+        f'\n    (symbol "{lib_id}" (pin_names (offset 1.016)) (exclude_from_sim no)'
+        f" (in_bom yes) (on_board yes)\n"
+        f'      (property "Reference" "X" (at 0 {half_h + 1.27:g} 0) (effects (font (size 1.27 1.27))))\n'
+        f'      (property "Value" "SUBCKT" (at 0 {-half_h - 1.27:g} 0) (effects (font (size 1.27 1.27))))\n'
+        f'      (property "Footprint" "" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))\n'
+        f'      (property "Datasheet" "~" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))\n'
+        f'      (symbol "{base_name}_0_1"\n'
+        f"        (rectangle (start -5.08 {-half_h:g}) (end 5.08 {half_h:g})\n"
+        f"          (stroke (width 0.254) (type default)) (fill (type background))\n"
+        f"        )\n"
+        f"      )\n"
+        f'      (symbol "{base_name}_1_1"\n'
+        + "\n".join(pin_lines)
+        + "\n      )\n    )"
+    )
+    return lib_id
+
+
 _SYMBOL_MAP: dict[str, KiCadSymbolInfo] = {
     "R": KiCadSymbolInfo("Device:R", ["1", "2"], [(0, -3.81), (0, 3.81)]),
     "C": KiCadSymbolInfo("Device:C", ["1", "2"], [(0, -2.54), (0, 2.54)]),
@@ -79,7 +152,9 @@ _SYMBOL_MAP: dict[str, KiCadSymbolInfo] = {
 }
 
 
-def _resolve_symbol_info(comp_type: str, value: str) -> KiCadSymbolInfo:
+def _resolve_symbol_info(
+    comp_type: str, value: str, n_nodes: int | None = None
+) -> KiCadSymbolInfo:
     """Return the KiCadSymbolInfo for a SPICE component type and value."""
     if comp_type == "Q":
         if "pnp" in value.lower():
@@ -90,13 +165,10 @@ def _resolve_symbol_info(comp_type: str, value: str) -> KiCadSymbolInfo:
             return _SYMBOL_MAP["M_PMOS"]
         return _SYMBOL_MAP["M_NMOS"]
     if comp_type == "X":
-        # Generic subcircuit — create a box with variable pin count
-        pin_numbers = [str(i + 1) for i in range(10)]
-        return KiCadSymbolInfo(
-            "Simulation_SPICE:SUBCKT",
-            pin_numbers,
-            [(0, i * 2.54) for i in range(10)],
-        )
+        # Generic subcircuit — a numbered box sized to the real pin count
+        n = max(3, n_nodes or 3)
+        lib_id = _ensure_subckt_symbol(n)
+        return KiCadSymbolInfo(lib_id, [str(i + 1) for i in range(n)], [])
     if comp_type in _SYMBOL_MAP:
         return _SYMBOL_MAP[comp_type]
     # Fallback: treat as 2-pin generic
@@ -119,6 +191,14 @@ def _snap_to_grid(val: float) -> float:
     return round(val / _GRID) * _GRID
 
 
+_HALF_GRID = 1.27  # symbol pins sit on the half-grid, not on the 2.54 mm grid
+
+
+def _snap_to_half_grid(val: float) -> float:
+    """Round a value to the nearest 1.27 mm half-grid point."""
+    return round(val / _HALF_GRID) * _HALF_GRID
+
+
 def _layout_components(
     components: list[ParsedComponent],
 ) -> list[PlacedComponent]:
@@ -139,19 +219,21 @@ def _layout_components(
 
     # Column 0: Sources (vertical, rotation 0)
     for i, comp in enumerate(sources):
-        sym = _resolve_symbol_info(comp.comp_type, comp.value)
+        sym = _resolve_symbol_info(comp.comp_type, comp.value, len(comp.nodes))
         y = _snap_to_grid(_Y_START + i * _Y_SPACING)
         placed.append(PlacedComponent(comp, _COL_SOURCES, y, 0, sym))
 
     # Column 1: Series (horizontal, rotation 270)
     for i, comp in enumerate(series):
-        sym = _resolve_symbol_info(comp.comp_type, comp.value)
+        sym = _resolve_symbol_info(comp.comp_type, comp.value, len(comp.nodes))
         y = _snap_to_grid(_Y_START + i * _Y_SPACING)
-        placed.append(PlacedComponent(comp, _COL_SERIES, y, 270, sym))
+        # 2-pin parts lie horizontally; transistors / subcircuit boxes stay upright
+        rot = 270 if len(comp.nodes) <= 2 else 0
+        placed.append(PlacedComponent(comp, _COL_SERIES, y, rot, sym))
 
     # Column 2: Shunt (vertical, rotation 0)
     for i, comp in enumerate(shunt):
-        sym = _resolve_symbol_info(comp.comp_type, comp.value)
+        sym = _resolve_symbol_info(comp.comp_type, comp.value, len(comp.nodes))
         y = _snap_to_grid(_Y_START + i * _Y_SPACING)
         placed.append(PlacedComponent(comp, _COL_SHUNT, y, 0, sym))
 
@@ -173,13 +255,24 @@ def _pin_positions(
     cos_a = math.cos(angle_rad)
     sin_a = math.sin(angle_rad)
 
+    lib_pins = _lib_pins(placed.symbol_info.lib_id)
+    numbers = _node_pin_numbers(placed.component.comp_type, len(placed.component.nodes))
+
     positions: list[tuple[float, float]] = []
-    n_pins = min(len(placed.component.nodes), len(placed.symbol_info.pin_offsets))
-    for i in range(n_pins):
-        dx, dy = placed.symbol_info.pin_offsets[i]
-        rx = dx * cos_a - dy * sin_a
-        ry = dx * sin_a + dy * cos_a
-        positions.append((_snap_to_grid(placed.x + rx), _snap_to_grid(placed.y + ry)))
+    for idx, number in enumerate(numbers):
+        if number in lib_pins:
+            dx, dy = lib_pins[number]
+        elif idx < len(placed.symbol_info.pin_offsets):
+            dx, dy = placed.symbol_info.pin_offsets[idx]
+        else:
+            continue
+        # library Y points up, schematic Y points down
+        sy = -dy
+        rx = dx * cos_a - sy * sin_a
+        ry = dx * sin_a + sy * cos_a
+        positions.append(
+            (_snap_to_half_grid(placed.x + rx), _snap_to_half_grid(placed.y + ry))
+        )
 
     return positions
 
@@ -286,7 +379,7 @@ def _find_net_labels(
 
 _LIB_SYMBOL_TEMPLATES: dict[str, str] = {
     "Device:R": """
-    (symbol "Device:R" (pin_names (offset 0)) (exclude_from_sim no) (in_bom yes) (on_board yes)
+    (symbol "Device:R" (pin_numbers hide) (pin_names (offset 0)) (exclude_from_sim no) (in_bom yes) (on_board yes)
       (property "Reference" "R" (at 2.032 0 90) (effects (font (size 1.27 1.27))))
       (property "Value" "R" (at -2.032 0 90) (effects (font (size 1.27 1.27))))
       (property "Footprint" "" (at -1.778 0 90) (effects (font (size 1.27 1.27)) hide))
@@ -302,7 +395,7 @@ _LIB_SYMBOL_TEMPLATES: dict[str, str] = {
       )
     )""",
     "Device:C": """
-    (symbol "Device:C" (pin_names (offset 0)) (exclude_from_sim no) (in_bom yes) (on_board yes)
+    (symbol "Device:C" (pin_numbers hide) (pin_names (offset 0)) (exclude_from_sim no) (in_bom yes) (on_board yes)
       (property "Reference" "C" (at 2.032 0 90) (effects (font (size 1.27 1.27))))
       (property "Value" "C" (at -2.032 0 90) (effects (font (size 1.27 1.27))))
       (property "Footprint" "" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))
@@ -321,7 +414,7 @@ _LIB_SYMBOL_TEMPLATES: dict[str, str] = {
       )
     )""",
     "Device:L": """
-    (symbol "Device:L" (pin_names (offset 0)) (exclude_from_sim no) (in_bom yes) (on_board yes)
+    (symbol "Device:L" (pin_numbers hide) (pin_names (offset 0)) (exclude_from_sim no) (in_bom yes) (on_board yes)
       (property "Reference" "L" (at 2.032 0 90) (effects (font (size 1.27 1.27))))
       (property "Value" "L" (at -2.032 0 90) (effects (font (size 1.27 1.27))))
       (property "Footprint" "" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))
@@ -352,7 +445,7 @@ _LIB_SYMBOL_TEMPLATES: dict[str, str] = {
       )
     )""",
     "Device:D": """
-    (symbol "Device:D" (pin_names (offset 0)) (exclude_from_sim no) (in_bom yes) (on_board yes)
+    (symbol "Device:D" (pin_numbers hide) (pin_names (offset 0)) (exclude_from_sim no) (in_bom yes) (on_board yes)
       (property "Reference" "D" (at 0 2.54 0) (effects (font (size 1.27 1.27))))
       (property "Value" "D" (at 0 -2.54 0) (effects (font (size 1.27 1.27))))
       (property "Footprint" "" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))
@@ -374,7 +467,7 @@ _LIB_SYMBOL_TEMPLATES: dict[str, str] = {
       )
     )""",
     "Simulation_SPICE:VDC": """
-    (symbol "Simulation_SPICE:VDC" (pin_names (offset 0.254)) (exclude_from_sim no) (in_bom yes) (on_board yes)
+    (symbol "Simulation_SPICE:VDC" (pin_numbers hide) (pin_names (offset 0.254)) (exclude_from_sim no) (in_bom yes) (on_board yes)
       (property "Reference" "V" (at 2.54 2.54 0) (effects (font (size 1.27 1.27)) (justify left)))
       (property "Value" "VDC" (at 2.54 0 0) (effects (font (size 1.27 1.27)) (justify left)))
       (property "Footprint" "" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))
@@ -399,7 +492,7 @@ _LIB_SYMBOL_TEMPLATES: dict[str, str] = {
       )
     )""",
     "Simulation_SPICE:IDC": """
-    (symbol "Simulation_SPICE:IDC" (pin_names (offset 0.254)) (exclude_from_sim no) (in_bom yes) (on_board yes)
+    (symbol "Simulation_SPICE:IDC" (pin_numbers hide) (pin_names (offset 0.254)) (exclude_from_sim no) (in_bom yes) (on_board yes)
       (property "Reference" "I" (at 2.54 2.54 0) (effects (font (size 1.27 1.27)) (justify left)))
       (property "Value" "IDC" (at 2.54 0 0) (effects (font (size 1.27 1.27)) (justify left)))
       (property "Footprint" "" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))
@@ -421,7 +514,7 @@ _LIB_SYMBOL_TEMPLATES: dict[str, str] = {
       )
     )""",
     "Device:Q_NPN_BCE": """
-    (symbol "Device:Q_NPN_BCE" (pin_names (offset 0)) (exclude_from_sim no) (in_bom yes) (on_board yes)
+    (symbol "Device:Q_NPN_BCE" (pin_numbers hide) (pin_names (offset 0)) (exclude_from_sim no) (in_bom yes) (on_board yes)
       (property "Reference" "Q" (at 5.08 1.905 0) (effects (font (size 1.27 1.27)) (justify left)))
       (property "Value" "Q_NPN_BCE" (at 5.08 0 0) (effects (font (size 1.27 1.27)) (justify left)))
       (property "Footprint" "" (at 5.08 -1.905 0) (effects (font (size 1.27 1.27)) hide))
@@ -447,7 +540,7 @@ _LIB_SYMBOL_TEMPLATES: dict[str, str] = {
       )
     )""",
     "Device:Q_PNP_BCE": """
-    (symbol "Device:Q_PNP_BCE" (pin_names (offset 0)) (exclude_from_sim no) (in_bom yes) (on_board yes)
+    (symbol "Device:Q_PNP_BCE" (pin_numbers hide) (pin_names (offset 0)) (exclude_from_sim no) (in_bom yes) (on_board yes)
       (property "Reference" "Q" (at 5.08 1.905 0) (effects (font (size 1.27 1.27)) (justify left)))
       (property "Value" "Q_PNP_BCE" (at 5.08 0 0) (effects (font (size 1.27 1.27)) (justify left)))
       (property "Footprint" "" (at 5.08 -1.905 0) (effects (font (size 1.27 1.27)) hide))
@@ -473,7 +566,7 @@ _LIB_SYMBOL_TEMPLATES: dict[str, str] = {
       )
     )""",
     "Device:Q_NMOS_GDS": """
-    (symbol "Device:Q_NMOS_GDS" (pin_names (offset 0)) (exclude_from_sim no) (in_bom yes) (on_board yes)
+    (symbol "Device:Q_NMOS_GDS" (pin_numbers hide) (pin_names (offset 0)) (exclude_from_sim no) (in_bom yes) (on_board yes)
       (property "Reference" "Q" (at 5.08 1.905 0) (effects (font (size 1.27 1.27)) (justify left)))
       (property "Value" "Q_NMOS_GDS" (at 5.08 0 0) (effects (font (size 1.27 1.27)) (justify left)))
       (property "Footprint" "" (at 5.08 -1.905 0) (effects (font (size 1.27 1.27)) hide))
@@ -502,7 +595,7 @@ _LIB_SYMBOL_TEMPLATES: dict[str, str] = {
       )
     )""",
     "Device:Q_PMOS_GDS": """
-    (symbol "Device:Q_PMOS_GDS" (pin_names (offset 0)) (exclude_from_sim no) (in_bom yes) (on_board yes)
+    (symbol "Device:Q_PMOS_GDS" (pin_numbers hide) (pin_names (offset 0)) (exclude_from_sim no) (in_bom yes) (on_board yes)
       (property "Reference" "Q" (at 5.08 1.905 0) (effects (font (size 1.27 1.27)) (justify left)))
       (property "Value" "Q_PMOS_GDS" (at 5.08 0 0) (effects (font (size 1.27 1.27)) (justify left)))
       (property "Footprint" "" (at 5.08 -1.905 0) (effects (font (size 1.27 1.27)) hide))
@@ -593,9 +686,9 @@ def _emit_symbol_instance(placed: PlacedComponent, sheet_uuid: str) -> str:
 
     # Build pin UUIDs
     pin_lines: list[str] = []
-    n_pins = min(len(comp.nodes), len(sym.pin_numbers))
-    for i in range(n_pins):
-        pin_lines.append(f'        (pin "{sym.pin_numbers[i]}" (uuid "{_uid()}"))')
+    numbers = _node_pin_numbers(comp.comp_type, len(comp.nodes))
+    for number in numbers:
+        pin_lines.append(f'        (pin "{number}" (uuid "{_uid()}"))')
 
     # Rotation angle for KiCad (uses degrees)
     angle = placed.rotation
@@ -616,7 +709,6 @@ def _emit_symbol_instance(placed: PlacedComponent, sheet_uuid: str) -> str:
         f'      (uuid "{sym_uuid}")',
     ]
     lines.extend(props)
-    lines.append("      (pin_names (offset 1.016))")
     lines.append("      (instances")
     lines.append('        (project ""')
     lines.append(f'          (path "/{sheet_uuid}"')
@@ -646,18 +738,16 @@ def _emit_power_symbol(x: float, y: float, sheet_uuid: str) -> str:
     """Emit a GND power port symbol at the given position."""
     sym_uuid = _uid()
     return (
-        f'    (symbol (lib_id "power:GND") (at {x} {y + 2.54} 0)\n'
-        f"      (mirror y)\n"
+        f'    (symbol (lib_id "power:GND") (at {x} {y} 0)\n'
         f'      (uuid "{sym_uuid}")\n'
-        f'      (property "Reference" "#PWR?" (at {x} {y + 3.81} 0)\n'
+        f'      (property "Reference" "#PWR?" (at {x} {y + 1.27} 0)\n'
         f"        (effects (font (size 1.27 1.27)) hide))\n"
-        f'      (property "Value" "GND" (at {x} {y + 5.08} 0)\n'
+        f'      (property "Value" "GND" (at {x} {y + 4.318} 0)\n'
         f"        (effects (font (size 1.27 1.27)) hide))\n"
         f'      (property "Footprint" "" (at {x} {y} 0)\n'
         f"        (effects (font (size 1.27 1.27)) hide))\n"
         f'      (property "Datasheet" "" (at {x} {y} 0)\n'
         f"        (effects (font (size 1.27 1.27)) hide))\n"
-        f"      (pin_names (offset 0))\n"
         f"      (instances\n"
         f'        (project ""\n'
         f'          (path "/{sheet_uuid}"\n'
@@ -682,7 +772,7 @@ def _emit_junction(x: float, y: float) -> str:
 def _emit_net_label(x: float, y: float, name: str) -> str:
     """Emit a net label."""
     return (
-        f'    (label "{name}" (at {x} {y - 2.54} 0) (fields_autoplaced yes)\n'
+        f'    (label "{name}" (at {x} {y} 0) (fields_autoplaced yes)\n'
         f"      (effects (font (size 1.27 1.27)))\n"
         f'      (uuid "{_uid()}")\n'
         f"    )"
@@ -712,7 +802,7 @@ _GND_LIB_SYMBOL = """
         )
       )
       (symbol "GND_1_1"
-        (pin power_in line (at 0 0 270) (length 0) (name "GND" (effects (font (size 1.27 1.27)))) (number "1" (effects (font (size 1.27 1.27)))))
+        (pin power_in line (at 0 0 270) (length 0) hide (name "GND" (effects (font (size 1.27 1.27)))) (number "1" (effects (font (size 1.27 1.27)))))
       )
     )"""
 
@@ -788,8 +878,9 @@ def export_kicad_schematic(
     # Lib symbols
     lib_sym = _build_lib_symbols(used_lib_ids)
     if ground_positions:
-        # Insert GND symbol into lib_symbols
-        lib_sym = lib_sym.replace("  )", _GND_LIB_SYMBOL + "\n  )", 1)
+        # Insert GND symbol into lib_symbols (anchor on the final closing paren:
+        # a plain "  )" replace also matches deeper-indented "      )" lines).
+        lib_sym = lib_sym[: -len("\n  )")] + _GND_LIB_SYMBOL + "\n  )"
     parts.append(lib_sym)
     parts.append("")
 
